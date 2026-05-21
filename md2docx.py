@@ -139,48 +139,148 @@ def set_paragraph_font(para, font_name=None, font_size=None):
                 run.font.size = Pt(font_size)
 
 
+def _find_system_chrome():
+    """
+    动态检测系统已安装的 Chrome / Edge / Chromium 可执行文件。
+    返回可执行文件的绝对路径，找不到则返回 None。
+    """
+    import platform
+    import os as _os
+
+    system = platform.system()
+    candidates = []
+
+    if system == 'Windows':
+        # 硬编码常见绝对路径，因为 Git Bash 下环境变量可能为空
+        local_app = os.getenv('LOCALAPPDATA', '')
+        candidates = [
+            r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+            _os.path.join(local_app, 'Google', 'Chrome', 'Application', 'chrome.exe') if local_app else '',
+            r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+            r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+        ]
+    elif system == 'Darwin':
+        candidates = [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            '/Applications/Chromium.app/Contents/MacOS/Chromium',
+            '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        ]
+    else:  # Linux
+        candidates = [
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/chromium',
+            '/usr/bin/microsoft-edge',
+        ]
+
+    for path in candidates:
+        if path and _os.path.isfile(path):
+            return path
+    return None
+
+
+def _find_mmdc():
+    """
+    查找 mmdc 可执行文件，优先级：
+    1. skill 目录下 node_modules/.bin/mmdc（或 mmdc.cmd on Windows）
+    2. 全局 npm 目录
+    3. PATH 查找
+    """
+    import platform
+    import os as _os
+
+    skill_dir = _os.path.dirname(_os.path.abspath(__file__))
+    is_windows = platform.system() == 'Windows'
+    mmdc_name = 'mmdc.cmd' if is_windows else 'mmdc'
+
+    # 1. skill 目录下本地安装
+    local_mmdc = _os.path.join(skill_dir, 'node_modules', '.bin', mmdc_name)
+    if _os.path.exists(local_mmdc):
+        return local_mmdc
+
+    # 2. 全局 npm 目录
+    app_data = os.getenv('APPDATA', '')
+    if app_data:
+        global_mmdc = _os.path.join(app_data, 'npm', mmdc_name)
+        if _os.path.exists(global_mmdc):
+            return global_mmdc
+
+    # 3. 兜底 PATH 查找
+    return mmdc_name
+
+
 def render_mermaid_to_image(mermaid_code, output_path):
     """将Mermaid代码渲染为图片（本地 mmdc 渲染）"""
-    try:
-        import subprocess
-        import tempfile
-        import shutil
+    import subprocess
+    import json
+    import uuid
+    import os as _os
 
+    try:
         mermaid_code = mermaid_code.strip()
 
-        # 将 Mermaid 代码写入临时文件（mmdc 需要从文件读取）
-        temp_dir = tempfile.gettempdir()
-        mmd_counter = len([f for f in os.listdir(temp_dir) if f.startswith('mermaid_tmp_')])
-        mmd_path = os.path.join(temp_dir, f'mermaid_tmp_{mmd_counter}.mmd')
+        # 使用 uuid 避免多进程竞态
+        tmp_id = uuid.uuid4().hex[:8]
+        mmd_path = _os.path.join(tempfile.gettempdir(), f'mermaid_tmp_{tmp_id}.mmd')
 
         with open(mmd_path, 'w', encoding='utf-8') as f:
             f.write(mermaid_code)
 
-        # 调用本地 mmdc 渲染
-        skill_dir = os.path.dirname(os.path.abspath(__file__))
-        mmdc_cmd = os.path.join(skill_dir, 'node_modules', '.bin', 'mmdc.cmd')
+        skill_dir = _os.path.dirname(_os.path.abspath(__file__))
+        mmdc_cmd = _find_mmdc()
+
+        # 构建 mmdc 命令参数
+        cmd_args = [mmdc_cmd, '-i', mmd_path, '-o', output_path, '-b', 'white']
+
+        # 动态检测系统 Chrome/Edge，生成临时 Puppeteer 配置
+        # 这样 mmdc 就不需要下载 chrome-headless-shell
+        chrome_path = _find_system_chrome()
+        puppeteer_config_path = None
+
+        if chrome_path:
+            config = {
+                'executablePath': chrome_path,
+                'cacheDirectory': _os.path.join(_os.path.expanduser('~'), '.cache', 'puppeteer'),
+            }
+            puppeteer_config_path = _os.path.join(tempfile.gettempdir(), f'puppeteerrc_{tmp_id}.json')
+            with open(puppeteer_config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f)
+            cmd_args.extend(['--puppeteerConfigFile', puppeteer_config_path])
+
+        # 也检查 skill 目录下的静态 .puppeteerrc.json（优先级低于动态检测）
+        if not chrome_path:
+            static_config = _os.path.join(skill_dir, '.puppeteerrc.json')
+            if _os.path.exists(static_config):
+                cmd_args.extend(['--puppeteerConfigFile', static_config])
 
         result = subprocess.run(
-            [mmdc_cmd, '-i', mmd_path, '-o', output_path, '-b', 'white'],
+            cmd_args,
             capture_output=True,
             timeout=60,
             cwd=skill_dir
         )
 
         # 清理临时文件
-        try:
-            os.remove(mmd_path)
-        except Exception:
-            pass
+        for tmp_file in [mmd_path, puppeteer_config_path]:
+            if tmp_file:
+                try:
+                    _os.remove(tmp_file)
+                except Exception:
+                    pass
 
-        if result.returncode == 0 and os.path.exists(output_path):
+        if result.returncode == 0 and _os.path.exists(output_path):
             return True
         else:
-            print(f"Mermaid渲染失败: {result.stderr.decode('utf-8', errors='ignore')}")
+            stderr_text = result.stderr.decode('utf-8', errors='ignore')
+            print(f"Mermaid渲染失败: {stderr_text}")
             return False
 
     except subprocess.TimeoutExpired:
         print("Mermaid渲染超时")
+        return False
+    except FileNotFoundError as e:
+        print(f"Mermaid渲染失败: mmdc 找不到 ({e})")
         return False
     except Exception as e:
         print(f"Mermaid渲染失败: {e}")
